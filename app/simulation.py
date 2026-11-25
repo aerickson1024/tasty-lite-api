@@ -26,7 +26,9 @@ N_SPREADS = len(SHORT_DELTAS)
 N_KEYS = len(ENTRY_DTES) * N_SPREADS
 PROFIT_TARGET = 0.5
 
-PATHS = 1_000_000_000  # untuned: retune so the Ryzen 7900 estimate is about 120-130 s
+PATHS = 200_000_000  # about 1.8 s warm on an RTX 3060
+MIN_PATHS = 1_000
+MAX_PATHS = 2_000_000_000
 BATCH_SIZE = 1_000_000
 BLOCK = 256  # must match BLOCK in _CUDA_SOURCE
 CALIBRATION_PATHS = 2_000_000
@@ -57,8 +59,19 @@ __device__ __forceinline__ unsigned long long splitmix64(unsigned long long &s) 
     return z ^ (z >> 31);
 }
 
+__device__ __forceinline__ unsigned long long mix64(unsigned long long z) {
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+
+// seed ^ (tid * golden) left streams of nearby threads/batches overlapping; hash both instead.
+__device__ __forceinline__ unsigned long long init_state(unsigned long long seed, unsigned long long tid) {
+    return mix64(mix64(seed ^ 0xD1B54A32D192ED03ull) + tid * 0x9E3779B97F4A7C15ull);
+}
+
 __device__ __forceinline__ float uniform01(unsigned long long &s) {
-    return ((float)(splitmix64(s) >> 40) + 0.5f) * (1.0f / 16777216.0f);
+    return ((float)(splitmix64(s) >> 41) + 0.5f) * (1.0f / 8388608.0f);
 }
 
 #define MAX_KEYS 32
@@ -83,8 +96,7 @@ extern "C" __global__ void managed_paths(
 
     const unsigned long long tid = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned long long stride = (unsigned long long)gridDim.x * blockDim.x;
-    unsigned long long state = seed ^ (tid * 0x9E3779B97F4A7C15ull);
-    splitmix64(state);
+    unsigned long long state = init_state(seed, tid);
 
     for (unsigned long long p = tid; p < n_paths; p += stride) {
         float pnl[MAX_KEYS];
@@ -99,6 +111,7 @@ extern "C" __global__ void managed_paths(
         float xa = logf(spot0);
         for (int t = 0; t < days; t++) {
             float zt = normcdfinvf(uniform01(state));
+            if (!isfinite(zt)) unclosed += 1.0;
             float ut = uniform01(state);
             float xb = xa + drift_day + vol_day * zt;
             float d = xb - xa;
@@ -131,7 +144,7 @@ extern "C" __global__ void managed_paths(
         }
 
         for (int k = 0; k < n_k; k++) {
-            if (isnan(pnl[k])) { unclosed += 1.0; continue; }
+            if (isnan(pnl[k]) || !isfinite(pnl[k])) { unclosed += 1.0; continue; }
             double v = pnl[k];
             acc[0][k] += v;
             acc[1][k] += v * v;
@@ -327,7 +340,7 @@ def _run_gpu(paths, mu, dev):
         batch_index += 1
     host = totals.get()
     if host[-1] > 0:
-        raise RuntimeError("simulation produced an unclosed spread")
+        raise RuntimeError("simulation produced an invalid path or unclosed spread")
     k = N_KEYS
     return {"sum": host[0:k], "sumsq": host[k:2 * k], "wins": host[2 * k:3 * k],
             "hits": host[3 * k:4 * k], "days": host[4 * k:5 * k]}
@@ -360,25 +373,25 @@ def _run_cpu(paths, mu, setup):
     return acc
 
 
-def _cpu_calibration_seconds(setup):
+def _cpu_seconds_per_path(setup):
     global _calibration_seconds
     if _calibration_seconds is None:
         _run_cpu(10_000, REAL_WORLD_DRIFT, setup)  # first call compiles the Numba kernel
         start = time.perf_counter()
         _run_cpu(CALIBRATION_PATHS, REAL_WORLD_DRIFT, setup)
         elapsed = time.perf_counter() - start
-        _calibration_seconds = elapsed * (PATHS / CALIBRATION_PATHS) * HOST_TO_RYZEN_7900_RATIO
+        _calibration_seconds = elapsed / CALIBRATION_PATHS * HOST_TO_RYZEN_7900_RATIO
     return _calibration_seconds
 
 
-def _build_response(device, elapsed, estimated, acc, setup):
+def _build_response(device, paths, elapsed, estimated, acc, setup):
     credit, short, _, _ = setup
-    mean = acc["sum"] / PATHS
-    variance = np.maximum(acc["sumsq"] / PATHS - mean * mean, 0.0)
-    standard_error = np.sqrt(variance / PATHS)
-    win_rate = acc["wins"] / PATHS
-    hit_rate = acc["hits"] / PATHS
-    avg_days = acc["days"] / PATHS
+    mean = acc["sum"] / paths
+    variance = np.maximum(acc["sumsq"] / paths - mean * mean, 0.0)
+    standard_error = np.sqrt(variance / paths)
+    win_rate = acc["wins"] / paths
+    hit_rate = acc["hits"] / paths
+    avg_days = acc["days"] / paths
 
     entries = []
     for e, dte in enumerate(ENTRY_DTES):
@@ -404,7 +417,7 @@ def _build_response(device, elapsed, estimated, acc, setup):
 
     return {
         "device": device,
-        "paths": PATHS,
+        "paths": paths,
         "dtype": "float32",
         "parameters": {
             "spot": SPOT,
@@ -422,19 +435,19 @@ def _build_response(device, elapsed, estimated, acc, setup):
     }
 
 
-def run_compute() -> dict:
+def run_compute(paths: int = PATHS) -> dict:
     with _lock:
         setup = _get_setup()
-        estimated = _cpu_calibration_seconds(setup)
+        estimated = _cpu_seconds_per_path(setup) * paths
         if GPU_AVAILABLE:
             device = "cuda"
             dev = _get_device_setup(setup)
             _run_gpu(1_000, REAL_WORLD_DRIFT, dev)  # first call compiles the CUDA kernel
             start = time.perf_counter()
-            acc = _run_gpu(PATHS, REAL_WORLD_DRIFT, dev)
+            acc = _run_gpu(paths, REAL_WORLD_DRIFT, dev)
         else:
             device = "cpu"
             start = time.perf_counter()
-            acc = _run_cpu(PATHS, REAL_WORLD_DRIFT, setup)
+            acc = _run_cpu(paths, REAL_WORLD_DRIFT, setup)
         elapsed = time.perf_counter() - start
-    return _build_response(device, elapsed, estimated, acc, setup)
+    return _build_response(device, paths, elapsed, estimated, acc, setup)

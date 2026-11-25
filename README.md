@@ -9,7 +9,7 @@ The market data is simulated, not real. The parameters are chosen to be in a rea
 | Method | Path       | Purpose                                                              |
 |--------|------------|----------------------------------------------------------------------|
 | GET    | `/health`  | Liveness check. Returns `{"status": "ok"}`.                          |
-| GET    | `/compute` | Runs the Monte Carlo simulation and returns the results and timings. |
+| GET    | `/compute` | Runs the Monte Carlo simulation and returns the results and timings. Optional query parameter `paths`. |
 
 `/compute` simulates `PATHS` price paths of the underlying and evaluates a put credit spread on each path. Fixed inputs:
 
@@ -46,7 +46,9 @@ The CPU kernel uses Numba with all logical cores. The GPU kernel is a CUDA kerne
 - P&L is not discounted. `expected_pnl` is the mean P&L at close.
 - Limit fills occur at the target price. The fill time is rounded to whole days.
 
-The request takes no body and no query parameters. The same inputs are used on every call.
+The request takes no body. The only query parameter is `paths` (integer, 1,000 to 2,000,000,000, default 200,000,000). Values outside that range, or non-integers, return 422. All other inputs are fixed.
+
+On the RTX 3060 a warm call at the default takes about 1.8 s (about 9 s per billion paths). The standard error of `expected_pnl` at the default is about 1.7e-4 for the 36 delta spread and 7.7e-5 for the 10 delta spread, shrinking with the square root of `paths`. The first call after startup is slower (about 3.6 s measured) because of CUDA kernel compilation and the CPU calibration.
 
 ## Requirements
 
@@ -119,14 +121,15 @@ Run the simulation:
 
 ```powershell
 curl.exe http://127.0.0.1:8000/compute
+curl.exe "http://127.0.0.1:8000/compute?paths=1000000000"
 ```
 
-Response shape (values are not yet measured for the spread simulation; run `/compute` to populate them):
+Response shape (values are illustrative; run `/compute` to populate them):
 
 ```json
 {
   "device": "cuda",
-  "paths": 1000000000,
+  "paths": 200000000,
   "dtype": "float32",
   "parameters": {
     "spot": 100.0,
@@ -190,7 +193,7 @@ Response shape (values are not yet measured for the spread simulation; run `/com
 
 ### How the Ryzen 7900 estimate works
 
-The host machine is itself a Ryzen 9 7900. The first `/compute` call simulates `CALIBRATION_PATHS` paths on the CPU, then scales the time linearly to `PATHS`. The result is an estimate, not a measured run on a 7900. The calibration is cached after the first call.
+The host machine is itself a Ryzen 9 7900. The first `/compute` call simulates `CALIBRATION_PATHS` paths on the CPU, and the time per path is cached. The estimate is that per-path time multiplied by the requested `paths`. It is an estimate, not a measured run on a 7900.
 
 The first GPU call includes a warm-up step that is excluded from `elapsed_seconds`.
 
@@ -215,7 +218,8 @@ Model inputs and simulation size are constants at the top of `app/simulation.py`
 | `ENTRY_DTES`, `CLOSE_DTE` | (45,), 21 | Entry days to expiration and time exit. |
 | `SHORT_DELTAS`          | 0.36 to 0.10 in steps of 0.02 (14 spreads) | Short put deltas simulated. |
 | `PROFIT_TARGET`         | 0.5         | Buy-to-close target as a fraction of entry credit. |
-| `PATHS`                 | 1,000,000,000 | Number of simulated paths. Untuned. Retune so the Ryzen 7900 estimate is about 120 to 130 seconds. |
+| `PATHS`                 | 200,000,000 | Default number of simulated paths when `paths` is not given. About 1.8 s warm on the GPU. |
+| `MIN_PATHS`, `MAX_PATHS` | 1,000, 2,000,000,000 | Accepted range of the `paths` query parameter. |
 | `BATCH_SIZE`            | 1,000,000   | Paths per GPU/CPU batch. Lower it if GPU memory runs out. |
 | `CALIBRATION_PATHS`     | 2,000,000   | Paths used to estimate the Ryzen 7900 runtime. |
 | `SEED`                  | 42          | GPU random seed. CPU is not seeded. |
@@ -232,3 +236,6 @@ Model inputs and simulation size are constants at the top of `app/simulation.py`
 - Changed `/compute` from POST to GET.
 - Replaced the European call simulation with the managed put credit spread simulation (45 and 38 DTE, 21 spreads each, 50% profit target, 21 DTE time exit). Added Numba CPU kernel and CUDA kernel. `PATHS` is untuned and runs have not been measured yet.
 - Scoped to 45 DTE only, short deltas 36 to 10 in 2-point steps (14 spreads). The CUDA kernel takes the entry count as a parameter.
+- Rewrote the CUDA kernel: random numbers (splitmix64) are generated in-kernel, results are reduced on the device, and setup arrays are cached on the GPU. 1e9 paths went from about 47 s to about 9 s.
+- Fixed overlapping random streams between threads and batches (start state is now a hash of seed and thread id). After the fix the GPU matches the CPU within statistical error (z-scores -0.96 to -0.42 across the 14 spreads at 1e9 GPU vs 5e8 CPU paths). Uniforms now use 23 bits so a draw can never be exactly 1, and non-finite draws raise an error.
+- Added the optional `paths` query parameter. Default `PATHS` is now 200,000,000 (about 1.8 s warm). The Ryzen 7900 estimate scales with the requested paths. The CPU fallback uses the same default and is not tuned.
