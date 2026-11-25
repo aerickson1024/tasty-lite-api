@@ -405,7 +405,7 @@ def _build_response(device, paths, elapsed, estimated, acc, setup):
                 "short_strike": round(ks, 2),
                 "long_strike": round(ks - WIDTH, 2),
                 "credit": round(c, 4),
-                "max_loss": round(WIDTH - c, 4),
+                "max_loss": round(WIDTH * math.exp(-RATE * CLOSE_DTE / 365.0) - c, 4),
                 "win_rate": round(float(win_rate[k]), 4),
                 "pct_closed_at_profit_target": round(float(hit_rate[k]), 4),
                 "pct_closed_at_21_dte": round(1.0 - float(hit_rate[k]), 4),

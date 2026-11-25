@@ -24,7 +24,7 @@ The market data is simulated, not real. The parameters are chosen to be in a rea
 | Close DTE           | 21 |
 | Profit target       | 50% of entry credit |
 
-For each entry DTE, 14 put credit spreads are built. The short put is the strike whose absolute delta is 0.36, 0.34, ..., 0.10 (Black-Scholes, 50% vol). The long put is 10 points below the short put. The credit is the spread's Black-Scholes value at entry, and max loss is 10 minus the credit.
+For each entry DTE, 14 put credit spreads are built. The short put is the strike whose absolute delta is 0.36, 0.34, ..., 0.10 (Black-Scholes, 50% vol). The long put is 10 points below the short put. The credit is the spread's Black-Scholes value at entry. Max loss is the simulated worst case: the width discounted from 21 DTE, `10 * exp(-rate * 21/365)`, minus the credit.
 
 ### Management rules
 
@@ -183,7 +183,7 @@ Response shape (values are illustrative; run `/compute` to populate them):
 | `entries[].spreads[].delta`    | Short put absolute delta times 100 (36 means 0.36). |
 | `short_strike`, `long_strike`  | Strikes of the short and long puts. `long_strike` is `short_strike - 10`. |
 | `credit`                       | Credit received at entry, per share. |
-| `max_loss`                     | `10 - credit`, per share. |
+| `max_loss`                     | Worst loss the simulation can produce, per share: `10 * exp(-rate * 21/365) - credit`. About 0.03 below the expiry maximum of `10 - credit`. |
 | `win_rate`                     | Fraction of paths with positive P&L at close. |
 | `pct_closed_at_profit_target`  | Fraction of paths closed at the 50% profit target. |
 | `pct_closed_at_21_dte`         | Fraction of paths closed at 21 DTE at fair value. |
@@ -197,12 +197,55 @@ The host machine is itself a Ryzen 9 7900. The first `/compute` call simulates `
 
 The first GPU call includes a warm-up step that is excluded from `elapsed_seconds`.
 
+## Evaluating a put credit vertical
+
+`POST /evaluate` returns the expected value of each put credit vertical in a request. The caller supplies the strikes (mid, IV, delta) from tastytrade. The endpoint does not choose candidates and does not sort results.
+
+```powershell
+curl.exe -X POST http://127.0.0.1:8000/evaluate -H "Content-Type: application/json" -d @request.json
+```
+
+Request fields:
+
+| Field              | Required | Meaning |
+|--------------------|----------|---------|
+| `symbol`           | yes      | Underlying symbol (label only). |
+| `option_type`      | yes      | Must be `put_credit_vertical`. |
+| `width`            | yes      | Distance between short and long strike. A long strike of `short - width` must be in `strikes`. |
+| `dte`              | yes      | Entry days to expiration. One DTE per request. |
+| `close_dte`        | yes      | Days to expiration at the time exit. Must be below `dte`. |
+| `strikes[]`        | yes      | `strike`, `mid`, `iv` (decimal), `delta` (put delta, negative). Strikes must be unique. |
+| `spot`             | yes      | Underlying price. |
+| `risk_free_rate`   | yes      | Decimal, for example 0.05. |
+| `dividend_yield`   | no       | Decimal, default 0. |
+| `realized_vol`     | yes      | Decimal volatility used for simulated paths, for example 0.5. Values above 5.0 are rejected to catch percent-vs-decimal mistakes. |
+| `drift`            | yes      | Decimal real-world drift of the underlying, for example 0.08. |
+| `profit_target`    | yes      | Fraction of entry credit to buy back at, above 0 and up to 1. |
+| `stop_loss`        | no       | Multiple of entry credit. The trade closes when the spread is worth `(1 + stop_loss) * credit`. Omit for no stop. |
+| `paths`            | no       | Simulated paths, 1,000 to 2,000,000,000. Default 200,000,000. |
+
+A request is rejected with 422 when `option_type` is not `put_credit_vertical`, `close_dte` is not below `dte`, strikes repeat, a mid is negative, `realized_vol` exceeds 5.0, `profit_target` is outside (0, 1], `stop_loss` is 0 or below, or `paths` is out of range. Strikes without a partner at `strike - width`, and spreads whose credit is not between 0 and `width`, are skipped silently.
+
+Response: each entry in `spreads` has `short_strike`, `long_strike`, `short_delta`, `short_iv`, `long_iv`, `credit`, `max_loss`, `expected_pnl`, `pnl_standard_error`, `win_rate`, `pct_closed_at_profit_target`, `pct_closed_at_stop_loss` (null without a stop), `pct_closed_at_close_dte`, and `avg_days_held`. The response also reports `device`, `paths`, `elapsed_seconds` and `assumptions`.
+
+Model assumptions:
+
+- Each leg is priced with Black-Scholes at its own IV, with the spot and rate from the request and the dividend yield applied. The IV is held fixed through the trade (sticky strike).
+- Entry credit is the mid of the short minus the mid of the long. Profit and stop barriers are modelled prices, so a mid that differs from the model price shifts the barriers.
+- Paths are GBM with daily steps. Barriers are checked against the Brownian-bridge daily high (profit) and low (stop), with barrier levels taken at mid-day.
+- If the stop and the profit target are both hit on the same day, the stop counts first.
+- `max_loss` is the smaller of the discounted width minus credit and `stop_loss * credit`.
+- Results are undiscounted. The drift is the real-world drift less the dividend yield.
+- Spreads are split into chunks of 32 per GPU launch, so runtime grows with spread count: about 1.8 s for 11 spreads and about 8.3 s for 41 spreads at the default paths.
+
 ## Project layout
 
 ```
 app/
-  main.py         FastAPI app and route definitions (/health, /compute)
+  main.py         FastAPI app and route definitions (/health, /compute, /evaluate)
   simulation.py   Monte Carlo model, CPU/GPU selection, timing and 7900 estimate
+  schemas.py      Request models and validation for /evaluate
+  evaluation.py   Put credit vertical engine for /evaluate (CPU and CUDA kernels)
 requirements.txt  Python dependencies
 .gitignore        Ignores virtual environments, caches and .env files
 README.md         This file
@@ -236,6 +279,8 @@ Model inputs and simulation size are constants at the top of `app/simulation.py`
 - Changed `/compute` from POST to GET.
 - Replaced the European call simulation with the managed put credit spread simulation (45 and 38 DTE, 21 spreads each, 50% profit target, 21 DTE time exit). Added Numba CPU kernel and CUDA kernel. `PATHS` is untuned and runs have not been measured yet.
 - Scoped to 45 DTE only, short deltas 36 to 10 in 2-point steps (14 spreads). The CUDA kernel takes the entry count as a parameter.
+- `max_loss` now reports the simulated worst case (discounted width minus credit) instead of `10 - credit`.
 - Rewrote the CUDA kernel: random numbers (splitmix64) are generated in-kernel, results are reduced on the device, and setup arrays are cached on the GPU. 1e9 paths went from about 47 s to about 9 s.
 - Fixed overlapping random streams between threads and batches (start state is now a hash of seed and thread id). After the fix the GPU matches the CPU within statistical error (z-scores -0.96 to -0.42 across the 14 spreads at 1e9 GPU vs 5e8 CPU paths). Uniforms now use 23 bits so a draw can never be exactly 1, and non-finite draws raise an error.
 - Added the optional `paths` query parameter. Default `PATHS` is now 200,000,000 (about 1.8 s warm). The Ryzen 7900 estimate scales with the requested paths. The CPU fallback uses the same default and is not tuned.
+- Added `POST /evaluate`: expected value and odds for caller-supplied put credit verticals, with optional stop loss (multiple of credit), dividend yield, and per-leg IV. Engine in `app/evaluation.py` with CPU and CUDA kernels. Validated against the Black-Scholes closed form (max |z| 0.58 at 2e6 paths) and GPU vs CPU with and without a stop (max |z| 1.34).
