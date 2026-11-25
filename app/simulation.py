@@ -28,6 +28,7 @@ PROFIT_TARGET = 0.5
 
 PATHS = 1_000_000_000  # untuned: retune so the Ryzen 7900 estimate is about 120-130 s
 BATCH_SIZE = 1_000_000
+BLOCK = 256  # must match BLOCK in _CUDA_SOURCE
 CALIBRATION_PATHS = 2_000_000
 SEED = 42
 HOST_TO_RYZEN_7900_RATIO = 1.0
@@ -35,6 +36,7 @@ HOST_TO_RYZEN_7900_RATIO = 1.0
 SQRT2 = math.sqrt(2.0)
 _lock = threading.Lock()
 _setup = None
+_device = None
 _calibration_seconds = None
 _gpu_kernel = None
 
@@ -48,61 +50,109 @@ __device__ float put_value(float spot, float strike, float tau, float rate, floa
          - spot * 0.5f * erfcf(d1 * 0.70710678f);
 }
 
+__device__ __forceinline__ unsigned long long splitmix64(unsigned long long &s) {
+    unsigned long long z = (s += 0x9E3779B97F4A7C15ull);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+
+__device__ __forceinline__ float uniform01(unsigned long long &s) {
+    return ((float)(splitmix64(s) >> 40) + 0.5f) * (1.0f / 16777216.0f);
+}
+
+#define MAX_KEYS 32
+#define BLOCK 256
+
 extern "C" __global__ void managed_paths(
-        const int n, const float* z, const float* u, const float* credit,
-        const float* shortk, const float* barrier, const int* close_t,
+        const unsigned long long n_paths, const unsigned long long seed,
+        const float* credit, const float* shortk, const float* barrier, const int* close_t,
         const float spot0, const float rate, const float sigma, const float mu,
         const float width, const int days, const int n_s, const int n_e,
-        float* pnl, int* day_out, unsigned char* hit) {
-    int i = blockDim.x * blockIdx.x + threadIdx.x;
-    if (i >= n) return;
+        const float tau_close, double* totals) {
     const int n_k = n_e * n_s;
     const float unset = __int_as_float(0x7fc00000);
     const float var_day = sigma * sigma / 365.0f;
     const float drift_day = (mu - 0.5f * sigma * sigma) / 365.0f;
-    const float vol_day = sigma * 0.05234834f;
-    const float tau_close = 21.0f / 365.0f;
+    const float vol_day = sigma / sqrtf(365.0f);
 
-    for (int k = 0; k < n_k; k++) {
-        pnl[i * n_k + k] = unset;
-        day_out[i * n_k + k] = 0;
-        hit[i * n_k + k] = 0;
-    }
+    double acc[5][MAX_KEYS];
+    for (int c = 0; c < 5; c++)
+        for (int k = 0; k < MAX_KEYS; k++) acc[c][k] = 0.0;
+    double unclosed = 0.0;
 
-    float xa = logf(spot0);
-    for (int t = 0; t < days; t++) {
-        float zt = z[i * days + t];
-        float ut = 1.0f - u[i * days + t];
-        float xb = xa + drift_day + vol_day * zt;
-        float d = xb - xa;
-        float m = xa + 0.5f * (d + sqrtf(d * d - 2.0f * var_day * logf(ut)));
-        for (int e = 0; e < n_e; e++) {
-            if (t >= close_t[e]) continue;
-            for (int s = 0; s < n_s; s++) {
-                int k = e * n_s + s;
-                int idx = i * n_k + k;
-                if (isnan(pnl[idx]) && m >= barrier[k * days + t]) {
-                    pnl[idx] = 0.5f * credit[k];
-                    day_out[idx] = t + 1;
-                    hit[idx] = 1;
-                }
-            }
-            if (t + 1 == close_t[e]) {
-                float price = expf(xb);
+    const unsigned long long tid = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned long long stride = (unsigned long long)gridDim.x * blockDim.x;
+    unsigned long long state = seed ^ (tid * 0x9E3779B97F4A7C15ull);
+    splitmix64(state);
+
+    for (unsigned long long p = tid; p < n_paths; p += stride) {
+        float pnl[MAX_KEYS];
+        int day_k[MAX_KEYS];
+        unsigned char hit_k[MAX_KEYS];
+        for (int k = 0; k < n_k; k++) {
+            pnl[k] = unset;
+            day_k[k] = 0;
+            hit_k[k] = 0;
+        }
+
+        float xa = logf(spot0);
+        for (int t = 0; t < days; t++) {
+            float zt = normcdfinvf(uniform01(state));
+            float ut = uniform01(state);
+            float xb = xa + drift_day + vol_day * zt;
+            float d = xb - xa;
+            float m = xa + 0.5f * (d + sqrtf(d * d - 2.0f * var_day * logf(ut)));
+            for (int e = 0; e < n_e; e++) {
+                if (t >= close_t[e]) continue;
                 for (int s = 0; s < n_s; s++) {
                     int k = e * n_s + s;
-                    int idx = i * n_k + k;
-                    if (isnan(pnl[idx])) {
-                        float ks = shortk[k];
-                        float v = put_value(price, ks, tau_close, rate, sigma)
-                                - put_value(price, ks - width, tau_close, rate, sigma);
-                        pnl[idx] = credit[k] - v;
-                        day_out[idx] = close_t[e];
+                    if (isnan(pnl[k]) && m >= barrier[k * days + t]) {
+                        pnl[k] = 0.5f * credit[k];
+                        day_k[k] = t + 1;
+                        hit_k[k] = 1;
+                    }
+                }
+                if (t + 1 == close_t[e]) {
+                    float price = expf(xb);
+                    for (int s = 0; s < n_s; s++) {
+                        int k = e * n_s + s;
+                        if (isnan(pnl[k])) {
+                            float ks = shortk[k];
+                            float v = put_value(price, ks, tau_close, rate, sigma)
+                                    - put_value(price, ks - width, tau_close, rate, sigma);
+                            pnl[k] = credit[k] - v;
+                            day_k[k] = close_t[e];
+                        }
                     }
                 }
             }
+            xa = xb;
         }
-        xa = xb;
+
+        for (int k = 0; k < n_k; k++) {
+            if (isnan(pnl[k])) { unclosed += 1.0; continue; }
+            double v = pnl[k];
+            acc[0][k] += v;
+            acc[1][k] += v * v;
+            acc[2][k] += (v > 0.0) ? 1.0 : 0.0;
+            acc[3][k] += hit_k[k];
+            acc[4][k] += day_k[k];
+        }
+    }
+
+    __shared__ double red[BLOCK];
+    const int n_vals = 5 * n_k + 1;
+    for (int j = 0; j < n_vals; j++) {
+        double v = (j < 5 * n_k) ? acc[j / n_k][j % n_k] : unclosed;
+        red[threadIdx.x] = v;
+        __syncthreads();
+        for (unsigned int off = BLOCK / 2; off > 0; off >>= 1) {
+            if (threadIdx.x < off) red[threadIdx.x] += red[threadIdx.x + off];
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) atomicAdd(&totals[j], red[0]);
+        __syncthreads();
     }
 }
 """
@@ -230,6 +280,13 @@ def _device_setup(setup):
             cp.asarray(close_t, dtype=cp.int32))
 
 
+def _get_device_setup(setup):
+    global _device
+    if _device is None:
+        _device = _device_setup(setup)
+    return _device
+
+
 def _get_gpu_kernel():
     global _gpu_kernel
     if _gpu_kernel is None:
@@ -247,66 +304,68 @@ def _batch_cpu(n, mu, setup):
     return pnl, days, hit
 
 
-def _batch_gpu(n, seed, mu, dev):
+def _run_gpu(paths, mu, dev):
     credit, short, barrier, close_t = dev
-    rng = cp.random.default_rng(seed)
-    z = rng.standard_normal((n, DAYS), dtype=cp.float32)
-    u = rng.random((n, DAYS), dtype=cp.float32)
-    pnl = cp.empty((n, N_KEYS), dtype=cp.float32)
-    days = cp.empty((n, N_KEYS), dtype=cp.int32)
-    hit = cp.empty((n, N_KEYS), dtype=cp.uint8)
-    block = 256
-    grid = (n + block - 1) // block
-    _get_gpu_kernel()(
-        (grid,), (block,),
-        (np.int32(n), z, u, credit, short, barrier, close_t,
-         np.float32(SPOT), np.float32(RATE), np.float32(VOLATILITY), np.float32(mu),
-         np.float32(WIDTH), np.int32(DAYS), np.int32(N_SPREADS), np.int32(len(ENTRY_DTES)),
-         pnl, days, hit),
-    )
-    return pnl, days, hit
-
-
-def _new_accumulator(xp):
-    return {key: xp.zeros(N_KEYS, dtype=xp.float64)
-            for key in ("sum", "sumsq", "wins", "hits", "days")}
-
-
-def _accumulate(acc, pnl, days, hit, xp):
-    p = pnl.astype(xp.float64)
-    if bool(xp.isnan(p).any()):
-        raise RuntimeError("simulation produced an unclosed spread")
-    acc["sum"] += p.sum(axis=0)
-    acc["sumsq"] += (p * p).sum(axis=0)
-    acc["wins"] += (p > 0).sum(axis=0)
-    acc["hits"] += hit.sum(axis=0, dtype=xp.float64)
-    acc["days"] += days.sum(axis=0, dtype=xp.float64)
-
-
-def _run(xp, paths, mu, setup, dev):
-    acc = _new_accumulator(xp)
+    kernel = _get_gpu_kernel()
+    n_vals = 5 * N_KEYS + 1
+    totals = cp.zeros(n_vals, dtype=cp.float64)
+    sm_count = cp.cuda.Device().attributes["MultiProcessorCount"]
+    grid = sm_count * 8
     done = 0
     batch_index = 0
     while done < paths:
         n = min(BATCH_SIZE, paths - done)
-        if xp is cp:
-            pnl, days, hit = _batch_gpu(n, SEED + batch_index, mu, dev)
-        else:
-            pnl, days, hit = _batch_cpu(n, mu, setup)
-        _accumulate(acc, pnl, days, hit, xp)
+        seed = (SEED * 1_000_003 + batch_index) & 0xFFFFFFFFFFFFFFFF
+        kernel(
+            (grid,), (BLOCK,),
+            (np.uint64(n), np.uint64(seed), credit, short, barrier, close_t,
+             np.float32(SPOT), np.float32(RATE), np.float32(VOLATILITY), np.float32(mu),
+             np.float32(WIDTH), np.int32(DAYS), np.int32(N_SPREADS), np.int32(len(ENTRY_DTES)),
+             np.float32(CLOSE_DTE / 365.0), totals),
+        )
         done += n
         batch_index += 1
-    if xp is cp:
-        return {key: value.get() for key, value in acc.items()}
+    host = totals.get()
+    if host[-1] > 0:
+        raise RuntimeError("simulation produced an unclosed spread")
+    k = N_KEYS
+    return {"sum": host[0:k], "sumsq": host[k:2 * k], "wins": host[2 * k:3 * k],
+            "hits": host[3 * k:4 * k], "days": host[4 * k:5 * k]}
+
+
+def _new_accumulator():
+    return {key: np.zeros(N_KEYS, dtype=np.float64)
+            for key in ("sum", "sumsq", "wins", "hits", "days")}
+
+
+def _accumulate(acc, pnl, days, hit):
+    p = pnl.astype(np.float64)
+    if bool(np.isnan(p).any()):
+        raise RuntimeError("simulation produced an unclosed spread")
+    acc["sum"] += p.sum(axis=0)
+    acc["sumsq"] += (p * p).sum(axis=0)
+    acc["wins"] += (p > 0).sum(axis=0)
+    acc["hits"] += hit.sum(axis=0, dtype=np.float64)
+    acc["days"] += days.sum(axis=0, dtype=np.float64)
+
+
+def _run_cpu(paths, mu, setup):
+    acc = _new_accumulator()
+    done = 0
+    while done < paths:
+        n = min(BATCH_SIZE, paths - done)
+        pnl, days, hit = _batch_cpu(n, mu, setup)
+        _accumulate(acc, pnl, days, hit)
+        done += n
     return acc
 
 
 def _cpu_calibration_seconds(setup):
     global _calibration_seconds
     if _calibration_seconds is None:
-        _run(np, 10_000, REAL_WORLD_DRIFT, setup, None)  # first call compiles the Numba kernel
+        _run_cpu(10_000, REAL_WORLD_DRIFT, setup)  # first call compiles the Numba kernel
         start = time.perf_counter()
-        _run(np, CALIBRATION_PATHS, REAL_WORLD_DRIFT, setup, None)
+        _run_cpu(CALIBRATION_PATHS, REAL_WORLD_DRIFT, setup)
         elapsed = time.perf_counter() - start
         _calibration_seconds = elapsed * (PATHS / CALIBRATION_PATHS) * HOST_TO_RYZEN_7900_RATIO
     return _calibration_seconds
@@ -368,12 +427,14 @@ def run_compute() -> dict:
         setup = _get_setup()
         estimated = _cpu_calibration_seconds(setup)
         if GPU_AVAILABLE:
-            device, xp = "cuda", cp
-            dev = _device_setup(setup)
-            _run(cp, 1_000, REAL_WORLD_DRIFT, setup, dev)  # first call compiles the CUDA kernel
+            device = "cuda"
+            dev = _get_device_setup(setup)
+            _run_gpu(1_000, REAL_WORLD_DRIFT, dev)  # first call compiles the CUDA kernel
+            start = time.perf_counter()
+            acc = _run_gpu(PATHS, REAL_WORLD_DRIFT, dev)
         else:
-            device, xp, dev = "cpu", np, None
-        start = time.perf_counter()
-        acc = _run(xp, PATHS, REAL_WORLD_DRIFT, setup, dev)
+            device = "cpu"
+            start = time.perf_counter()
+            acc = _run_cpu(PATHS, REAL_WORLD_DRIFT, setup)
         elapsed = time.perf_counter() - start
     return _build_response(device, elapsed, estimated, acc, setup)
