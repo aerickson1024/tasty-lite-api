@@ -238,14 +238,43 @@ Model assumptions:
 - Results are undiscounted. The drift is the real-world drift less the dividend yield.
 - Spreads are split into chunks of 32 per GPU launch, so runtime grows with spread count: about 1.8 s for 11 spreads and about 8.3 s for 41 spreads at the default paths.
 
+## Analyzing a spread
+
+`POST /analyze` takes one spread object from an `/evaluate` response and returns return and annualized metrics. It does no simulation and needs no GPU.
+
+Request fields:
+
+| Field           | Required | Meaning |
+|-----------------|----------|---------|
+| `short_strike`  | yes      | Strike sold. Must be above `long_strike`. |
+| `long_strike`   | yes      | Strike bought. |
+| `credit`        | yes      | Entry credit per share. Must be below the width. |
+| `expected_pnl`  | yes      | Expected P&L per share, from `/evaluate`. |
+| `avg_days_held` | yes      | Average days held, from `/evaluate`. |
+| `max_loss`      | no       | Simulated worst case per share. Only adds a per-contract figure. |
+| `profit_target` | no       | Fraction of credit, used for profit target dollars. |
+
+Other fields in the `/evaluate` response (deltas, IVs, win rate) are ignored, so a spread object can be sent as is.
+
+Formulas, with capital at risk $C = \text{width} - \text{credit}$ and $n = 365 / \text{avg\_days\_held}$:
+
+- Return on capital: $r = \text{expected\_pnl} / C$
+- APR (simple): $r \cdot n$
+- CAGR (compounded): $(1 + r)^n - 1$, or $-1$ when $r \le -1$. Null if the power overflows.
+- Breakeven price: short strike minus credit. Max profit: credit. Profit target dollars: credit times `profit_target`.
+- Risk/reward: $C / \text{credit}$. EV per day: expected P&L / avg days held.
+
+Assumptions: capital is width minus credit, the year is 365 days, there are no fees or slippage, and capital is redeployed back to back. When a stop loss is used, switch the capital basis to the supplied `max_loss`.
+
 ## Project layout
 
 ```
 app/
-  main.py         FastAPI app and route definitions (/health, /compute, /evaluate)
+  main.py         FastAPI app and route definitions (/health, /compute, /evaluate, /analyze)
   simulation.py   Monte Carlo model, CPU/GPU selection, timing and 7900 estimate
-  schemas.py      Request models and validation for /evaluate
+  schemas.py      Request models and validation for /evaluate and /analyze
   evaluation.py   Put credit vertical engine for /evaluate (CPU and CUDA kernels)
+  analysis.py     Return, APR and CAGR metrics for /analyze
 requirements.txt  Python dependencies
 .gitignore        Ignores virtual environments, caches and .env files
 README.md         This file
@@ -284,3 +313,4 @@ Model inputs and simulation size are constants at the top of `app/simulation.py`
 - Fixed overlapping random streams between threads and batches (start state is now a hash of seed and thread id). After the fix the GPU matches the CPU within statistical error (z-scores -0.96 to -0.42 across the 14 spreads at 1e9 GPU vs 5e8 CPU paths). Uniforms now use 23 bits so a draw can never be exactly 1, and non-finite draws raise an error.
 - Added the optional `paths` query parameter. Default `PATHS` is now 200,000,000 (about 1.8 s warm). The Ryzen 7900 estimate scales with the requested paths. The CPU fallback uses the same default and is not tuned.
 - Added `POST /evaluate`: expected value and odds for caller-supplied put credit verticals, with optional stop loss (multiple of credit), dividend yield, and per-leg IV. Engine in `app/evaluation.py` with CPU and CUDA kernels. Validated against the Black-Scholes closed form (max |z| 0.58 at 2e6 paths) and GPU vs CPU with and without a stop (max |z| 1.34).
+- Added `POST /analyze`: return on capital, APR, CAGR, breakeven, risk/reward, EV per day and per-contract dollars for one spread from `/evaluate`. Pure arithmetic, no simulation.

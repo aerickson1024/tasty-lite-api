@@ -36,3 +36,21 @@ class EvaluateRequest(BaseModel):
         if len(set(strikes)) != len(strikes):
             raise ValueError("strikes must be unique")
         return self
+
+
+class AnalyzeRequest(BaseModel):
+    short_strike: float = Field(gt=0)
+    long_strike: float = Field(gt=0)
+    credit: float = Field(gt=0)
+    expected_pnl: float
+    avg_days_held: float = Field(gt=0)
+    max_loss: Optional[float] = Field(default=None, gt=0)
+    profit_target: Optional[float] = Field(default=None, gt=0, le=1)
+
+    @model_validator(mode="after")
+    def check_spread(self):
+        if self.short_strike <= self.long_strike:
+            raise ValueError("short_strike must be above long_strike")
+        if self.credit >= self.short_strike - self.long_strike:
+            raise ValueError("credit must be below the width")
+        return self
