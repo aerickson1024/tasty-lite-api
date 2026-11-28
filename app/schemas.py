@@ -2,7 +2,9 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
-from app.simulation import MAX_PATHS, MIN_PATHS, PATHS
+PATHS = 200_000_000
+MIN_PATHS = 1_000
+MAX_PATHS = 2_000_000_000
 
 
 class StrikeQuote(BaseModel):

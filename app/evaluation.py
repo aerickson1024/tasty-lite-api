@@ -5,8 +5,15 @@ import time
 import numpy as np
 from numba import njit, prange
 
-from app.simulation import GPU_AVAILABLE, cp
 from app.schemas import EvaluateRequest
+
+try:
+    import cupy as cp
+
+    GPU_AVAILABLE = cp.cuda.runtime.getDeviceCount() > 0
+except Exception:
+    cp = None
+    GPU_AVAILABLE = False
 
 SQRT2 = math.sqrt(2.0)
 LOG_LO = math.log(1e-3)  # log-spot search bounds for barrier bisection
